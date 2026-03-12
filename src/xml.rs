@@ -453,3 +453,154 @@ struct PlaylistTrack {
     #[serde(rename = "@Key")]
     key: i32,
 }
+
+/// Convert a PDB file path and Windows base path into a rekordbox file:// URI.
+fn make_location_uri(base_path: &str, pdb_file_path: &str) -> String {
+    // Normalise base to forward slashes, strip trailing slash
+    let base = base_path.replace('\\', "/").trim_end_matches('/').to_string();
+    // PDB paths start with '/', e.g. /Contents/Artist/file.mp3
+    let rel = pdb_file_path.trim_start_matches('/');
+    let full = format!("{}/{}", base, rel);
+    // Percent-encode spaces (and a minimal set of unsafe chars)
+    let encoded = full
+        .chars()
+        .flat_map(|c| match c {
+            ' ' => vec!['%', '2', '0'],
+            '#' => vec!['%', '2', '3'],
+            '%' => vec!['%', '2', '5'],
+            '?' => vec!['%', '3', 'F'],
+            _ => vec![c],
+        })
+        .collect::<String>();
+    format!("file://localhost/{}", encoded)
+}
+
+fn pdb_node_to_xml(
+    node: crate::device::PlaylistNode,
+    pdb: &crate::device::Pdb,
+) -> crate::Result<PlaylistGenericNode> {
+    use crate::device::PlaylistNode;
+    match node {
+        PlaylistNode::Folder(folder) => {
+            let children = folder
+                .children
+                .into_iter()
+                .map(|child| pdb_node_to_xml(child, pdb))
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(PlaylistGenericNode::Folder(PlaylistFolderNode {
+                name: folder.name,
+                nodes: children,
+            }))
+        }
+        PlaylistNode::Playlist(playlist) => {
+            let mut entries: Vec<(u32, crate::pdb::TrackId)> =
+                pdb.get_playlist_entries(playlist.id).collect();
+            entries.sort_by_key(|(idx, _)| *idx);
+            let tracks = entries
+                .into_iter()
+                .map(|(_, track_id)| PlaylistTrack {
+                    key: track_id.0 as i32,
+                })
+                .collect();
+            Ok(PlaylistGenericNode::Playlist(PlaylistPlaylistNode {
+                name: playlist.name,
+                keytype: "0".to_string(),
+                tracks,
+            }))
+        }
+    }
+}
+
+/// Build a rekordbox XML `Document` from a parsed PDB and write it to `writer`.
+///
+/// `base_path` is the Windows path prefix for tracks, e.g. `O:\PIONEER\ESD USB N Drive`.
+pub fn write_from_pdb<W: std::io::Write>(
+    pdb: &crate::device::Pdb,
+    base_path: &str,
+    writer: &mut W,
+) -> crate::Result<()> {
+    use std::collections::HashMap;
+
+    let track_map: HashMap<_, _> = pdb.get_tracks().map(|t| (t.id, t)).collect();
+
+    let xml_tracks: Vec<Track> = track_map
+        .values()
+        .filter_map(|t| {
+            let file_path = t.offsets.inner.file_path.clone().into_string().ok()?;
+            let title = t.offsets.inner.title.clone().into_string().ok()?;
+            let location = make_location_uri(base_path, &file_path);
+
+            let opt_str = |s: crate::pdb::string::DeviceSQLString| -> Option<String> {
+                s.into_string().ok().filter(|v| !v.is_empty())
+            };
+
+            Some(Track {
+                trackid: t.id.0 as i32,
+                name: Some(title),
+                artist: None,
+                composer: None,
+                album: None,
+                grouping: None,
+                genre: None,
+                kind: None,
+                size: Some(t.file_size as i64),
+                totaltime: Some(t.duration as f64),
+                discnumber: Some(t.disc_number as i32),
+                tracknumber: Some(t.track_number as i32),
+                year: Some(t.year as i32),
+                averagebpm: if t.tempo > 0 {
+                    Some(t.tempo as f64 / 100.0)
+                } else {
+                    None
+                },
+                datemodified: None,
+                dateadded: opt_str(t.offsets.inner.date_added.clone()),
+                bitrate: Some(t.bitrate as i32),
+                samplerate: Some(t.sample_rate as f64),
+                comments: opt_str(t.offsets.inner.comment.clone()),
+                playcount: Some(t.play_count as i32),
+                lastplayed: None,
+                rating: Some(t.rating as i32),
+                location,
+                remixer: None,
+                tonality: None,
+                label: None,
+                mix: opt_str(t.offsets.inner.mix_name.clone()),
+                colour: None,
+                tempos: vec![],
+                position_marks: vec![],
+            })
+        })
+        .collect();
+
+    let xml_nodes = pdb
+        .get_playlists()?
+        .into_iter()
+        .map(|n| pdb_node_to_xml(n, pdb))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let doc = Document {
+        version: "1.0.0".to_string(),
+        product: Product {
+            name: "rekordbox".to_string(),
+            version: "6.0.0".to_string(),
+            company: "AlphaTheta".to_string(),
+        },
+        collection: Collection {
+            entries: xml_tracks.len() as i32,
+            track: xml_tracks,
+        },
+        playlists: Playlists {
+            node: PlaylistFolderNode {
+                name: "ROOT".to_string(),
+                nodes: xml_nodes,
+            },
+        },
+    };
+
+    writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
+    let xml_str = quick_xml::se::to_string(&doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    writer.write_all(xml_str.as_bytes())?;
+    Ok(())
+}

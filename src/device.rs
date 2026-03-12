@@ -89,15 +89,12 @@ impl DeviceExport {
             .tables
             .iter()
             .flat_map(|table| {
-                header
-                    .read_pages(
-                        &mut reader,
-                        binrw::Endian::NATIVE,
-                        (&table.first_page, &table.last_page, DatabaseType::Plain),
-                    )
-                    .into_iter()
+                header.read_pages_lossy(
+                    &mut reader,
+                    binrw::Endian::NATIVE,
+                    (&table.first_page, &table.last_page, DatabaseType::Plain),
+                )
             })
-            .flatten()
             .collect::<Vec<Page>>();
 
         let pdb = Pdb { header, pages };
@@ -601,15 +598,12 @@ impl Pdb {
             .tables
             .iter()
             .flat_map(|table| {
-                header
-                    .read_pages(
-                        &mut reader,
-                        binrw::Endian::NATIVE,
-                        (&table.first_page, &table.last_page, DatabaseType::Plain),
-                    )
-                    .into_iter()
+                header.read_pages_lossy(
+                    &mut reader,
+                    binrw::Endian::NATIVE,
+                    (&table.first_page, &table.last_page, DatabaseType::Plain),
+                )
             })
-            .flatten()
             .collect::<Vec<Page>>();
 
         let pdb = Pdb { header, pages };

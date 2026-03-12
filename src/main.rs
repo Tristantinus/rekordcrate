@@ -45,6 +45,18 @@ enum Commands {
         #[arg(value_name = "OUTPUT_DIR")]
         output_dir: PathBuf,
     },
+    /// Export playlists and tracks from a Pioneer Database (`.PDB`) file to a rekordbox XML file.
+    ExportXML {
+        /// Path to the export root (the folder containing the `PIONEER` directory).
+        #[arg(value_name = "EXPORT_PATH")]
+        path: PathBuf,
+        /// Base path prefix for track locations in the XML (e.g. `O:\PIONEER\ESD USB N Drive`).
+        #[arg(value_name = "BASE_PATH")]
+        base_path: String,
+        /// Output XML file path.
+        #[arg(value_name = "OUTPUT_FILE")]
+        output: PathBuf,
+    },
     /// Parse and dump a Rekordbox Analysis (`ANLZXXXX.DAT`) file.
     DumpANLZ {
         /// File to parse.
@@ -141,8 +153,9 @@ fn export_playlists(path: &Path, output_dir: &PathBuf) -> rekordcrate::Result<()
     ) -> rekordcrate::Result<()> {
         match node {
             PlaylistNode::Folder(folder) => {
+                let safe_name = folder.name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-").trim().to_string();
                 folder.children.into_iter().try_for_each(|child| {
-                    walk_tree(pdb, tracks, child, &path.join(&folder.name), export_path)
+                    walk_tree(pdb, tracks, child, &path.join(&safe_name), export_path)
                 })?;
             }
             PlaylistNode::Playlist(playlist) => {
@@ -151,7 +164,8 @@ fn export_playlists(path: &Path, output_dir: &PathBuf) -> rekordcrate::Result<()
                 playlist_entries.sort_by_key(|entry| entry.0);
 
                 std::fs::create_dir_all(path)?;
-                let playlist_path = path.join(format!("{}.m3u", playlist.name));
+                let safe_name = playlist.name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-").trim().to_string();
+                let playlist_path = path.join(format!("{}.m3u", safe_name));
 
                 println!("{}", playlist_path.display());
                 let mut file = std::fs::File::create(playlist_path)?;
@@ -179,6 +193,20 @@ fn export_playlists(path: &Path, output_dir: &PathBuf) -> rekordcrate::Result<()
         .into_iter()
         .try_for_each(|node| walk_tree(pdb, &tracks, node, output_dir, export.get_path()))?;
 
+    Ok(())
+}
+
+fn export_xml(path: &Path, base_path: &str, output: &PathBuf) -> rekordcrate::Result<()> {
+    use rekordcrate::device::Pdb;
+
+    let pdb_path = path
+        .join("PIONEER")
+        .join("rekordbox")
+        .join("export.pdb");
+    let pdb = Pdb::open_from_path(&pdb_path)?;
+    let mut file = std::fs::File::create(output)?;
+    rekordcrate::xml::write_from_pdb(&pdb, base_path, &mut file)?;
+    println!("Written: {}", output.display());
     Ok(())
 }
 
@@ -210,14 +238,18 @@ fn dump_pdb(path: &PathBuf, typ: DatabaseType) -> rekordcrate::Result<()> {
 
     for (i, table) in header.tables.iter().enumerate() {
         println!("Table {}: {:?}", i, table.page_type);
-        for page in header
-            .read_pages(
-                &mut reader,
-                binrw::Endian::NATIVE,
-                (&table.first_page, &table.last_page, typ),
-            )
-            .unwrap()
-            .into_iter()
+        let pages = match header.read_pages(
+            &mut reader,
+            binrw::Endian::NATIVE,
+            (&table.first_page, &table.last_page, typ),
+        ) {
+            Ok(pages) => pages,
+            Err(e) => {
+                eprintln!("  Error reading pages for table {i}: {e}");
+                continue;
+            }
+        };
+        for page in pages.into_iter()
         {
             println!("  {:?}", page);
             match page.content {
@@ -300,6 +332,7 @@ fn main() -> rekordcrate::Result<()> {
         Commands::ListPlaylists { path } => list_playlists(path),
         Commands::ListSettings { path } => list_settings(path),
         Commands::ExportPlaylists { path, output_dir } => export_playlists(path, output_dir),
+        Commands::ExportXML { path, base_path, output } => export_xml(path, base_path, output),
         Commands::DumpPDB { path, db_type } => {
             let db_type = match guess_db_type(path, db_type.as_deref()) {
                 Some(db_type) => db_type,
